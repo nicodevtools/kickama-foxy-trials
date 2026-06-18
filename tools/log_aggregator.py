@@ -56,6 +56,9 @@ logger = logging.getLogger("log_aggregator")
 # LOG PARSERS
 # ---------------------------------------------------------------------------
 
+from typing import Any, Dict, List, Optional, Tuple, Counter
+
+
 class LogParser:
     """Base class for log parsers. Subclasses implement format-specific parsing."""
 
@@ -114,6 +117,7 @@ class LogParser:
 
 
 class JSONLogParser(LogParser):
+    """Parser for JSON log format."""
     """Parses structured JSON log lines."""
 
     def parse(self, line: str) -> Optional[Dict[str, Any]]:
@@ -134,6 +138,7 @@ class JSONLogParser(LogParser):
 
 
 class TextLogParser(LogParser):
+    """Parser for plain text log format."""
     """Parses plain text log lines."""
 
     def parse(self, line: str) -> Optional[Dict[str, Any]]:
@@ -152,6 +157,7 @@ class TextLogParser(LogParser):
 
 
 class NginxLogParser(LogParser):
+    """Parser for nginx log format."""
     """Parses Nginx access log format."""
 
     NGINX_PATTERN = re.compile(
@@ -203,6 +209,7 @@ class NginxLogParser(LogParser):
 # ---------------------------------------------------------------------------
 
 class LogAggregator:
+    """Aggregates logs from multiple sources."""
     def __init__(self):
         self.parsers = [JSONLogParser(), TextLogParser(), NginxLogParser()]
         self.entries: List[Dict[str, Any]] = []
@@ -214,6 +221,7 @@ class LogAggregator:
         self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
 
     def process_file(self, filepath: str) -> int:
+        """Process a single log file."""
         parsed_count = 0
         try:
             if filepath.endswith('.gz'):
@@ -241,6 +249,7 @@ class LogAggregator:
         return total
 
     def _parse_line(self, line: str) -> bool:
+        """Parse a single log line."""
         for parser in self.parsers:
             entry = parser.parse(line)
             if entry:
@@ -263,6 +272,7 @@ class LogAggregator:
         return False
 
     def get_summary(self) -> Dict[str, Any]:
+        """Get summary statistics."""
         return {
             'total_entries': len(self.entries),
             'time_range': self._get_time_range(),
@@ -278,6 +288,7 @@ class LogAggregator:
         }
 
     def _get_time_range(self) -> Optional[Dict[str, str]]:
+        """Get time range of entries."""
         timestamps = [
             e['timestamp'] for e in self.entries
             if e.get('timestamp')
@@ -291,6 +302,7 @@ class LogAggregator:
         }
 
     def _calculate_error_rate(self) -> float:
+        """Calculate error rate percentage."""
         total = len(self.entries)
         if total == 0:
             return 0.0
@@ -340,7 +352,8 @@ class LogAggregator:
                 results.append(entry)
         return results
 
-    def export_csv(self, output_path: str, max_entries: int = 10000):
+    def export_csv(self, output_path: str, max_entries: int = 10000) -> None:
+        """Export entries as CSV."""
         fields = ['timestamp', 'level', 'service', 'message']
         with open(output_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
@@ -349,7 +362,8 @@ class LogAggregator:
                 writer.writerow(entry)
         logger.info(f"Exported {min(len(self.entries), max_entries)} entries to {output_path}")
 
-    def export_json(self, output_path: str):
+    def export_json(self, output_path: str) -> None:
+        """Export entries as JSON."""
         with open(output_path, 'w') as f:
             json.dump({
                 'summary': self.get_summary(),
