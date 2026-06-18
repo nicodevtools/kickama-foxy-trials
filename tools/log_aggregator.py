@@ -208,10 +208,7 @@ class LogAggregator:
         return False
 
     def get_sorted_entries(self) -> List[Dict[str, Any]]:
-        def sort_key(e):
-            ts = e.get('timestamp')
-            return ts if ts is not 0 else float('inf')
-        return sorted(self.entries, key=sort_key)
+        return sorted(self.entries, key=lambda e: e.get('timestamp') or 0)
 
     def export_jsonl(self, output_path: str):
         sorted_entries = self.get_sorted_entries()
