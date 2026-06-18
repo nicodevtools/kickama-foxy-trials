@@ -776,7 +776,81 @@ def print_summary(results: list[tuple[str, bool, float, str, Optional[str]]]):
           f"{color(str(failed) + ' failed', Colors.RED)}, "
           f"{total_time:.1f}s total")
 
+__version__ = "1.0.0"
+
+
+def parse_args():
+    """Parse CLI arguments for build.py."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Build system for the zeroeye platform",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 build.py                    Build all modules
+  python3 build.py -t backend         Build only backend
+  python3 build.py -t backend,frontend Build multiple modules
+  python3 build.py --skip-diagnostics Skip diagnostic generation
+  python3 build.py -vvv               Verbose output
+        """,
+    )
+    parser.add_argument(
+        "-t", "--target",
+        help="Comma-separated list of modules to build (default: all)",
+        default="all",
+    )
+    parser.add_argument(
+        "--skip-diagnostics",
+        action="store_true",
+        help="Skip diagnostic generation (faster iteration)",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="count",
+        default=0,
+        help="Increase log verbosity (can be specified multiple times: -vvv)",
+    )
+    parser.add_argument(
+        "-o", "--output-dir",
+        help="Custom output directory for build artifacts",
+        default="./build",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    
+    # Set verbosity level
+    verbosity = args.verbose
+    
+    # Parse targets
+    if args.target == "all":
+        targets = ["all"]
+    else:
+        targets = [t.strip() for t in args.target.split(",")]
+    
+    # Validate targets
+    valid_modules = ["backend", "frontend", "market", "all"]
+    invalid = [t for t in targets if t not in valid_modules]
+    if invalid:
+        print(f"Error: Unknown targets: {', '.join(invalid)}")
+        print(f"Valid targets: {', '.join(valid_modules)}")
+        sys.exit(1)
+    
+    # Skip diagnostics if requested
+    skip_diagnostics = args.skip_diagnostics
+    
+    # Output directory
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    
+
     parser = argparse.ArgumentParser(
         description="Tent of Trials  -  Multi-Language Build System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
