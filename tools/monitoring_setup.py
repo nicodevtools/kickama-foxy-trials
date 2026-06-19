@@ -25,12 +25,14 @@ Usage:
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -39,6 +41,7 @@ from typing import Any, Dict, List, Optional
 DEFAULT_PROMETHEUS_URL = "http://localhost:9090"
 DEFAULT_ALERTMANAGER_URL = "http://localhost:9093"
 DEFAULT_GRAFANA_URL = "http://localhost:3000"
+DEFAULT_PROMETHEUS_PORT_FALLBACKS = 3
 
 DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "..", "monitoring", "dashboards")
 ALERT_RULES_DIR = os.path.join(os.path.dirname(__file__), "..", "monitoring", "alerts")
@@ -150,6 +153,54 @@ RECOMMENDED_RECORDING_RULES: List[Dict[str, Any]] = [
     {"name": "instance:cpu_usage:ratio", "expr": "rate(process_cpu_seconds_total[5m])"},
     {"name": "service:uptime:days", "expr": "time() - process_start_time_seconds{job=~'.+'}"},
 ]
+
+
+def is_local_host(hostname: str) -> bool:
+    return hostname in {"", "localhost", "127.0.0.1", "::1"}
+
+
+def is_port_available(hostname: str, port: int) -> bool:
+    bind_host = "127.0.0.1" if hostname in {"", "localhost"} else hostname
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((bind_host, port))
+        except OSError:
+            return False
+    return True
+
+
+def resolve_prometheus_url(
+    prometheus_url: str,
+    port_fallbacks: int = DEFAULT_PROMETHEUS_PORT_FALLBACKS,
+    port_available: Callable[[str, int], bool] = is_port_available,
+) -> str:
+    parsed = urllib.parse.urlsplit(prometheus_url)
+    if not is_local_host(parsed.hostname or "") or parsed.port is None:
+        return prometheus_url
+    if port_fallbacks <= 0 or port_available(parsed.hostname or "localhost", parsed.port):
+        return prometheus_url
+
+    original_port = parsed.port
+    for port in range(original_port + 1, original_port + port_fallbacks + 1):
+        if port_available(parsed.hostname or "localhost", port):
+            host = parsed.hostname or "localhost"
+            netloc = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
+            resolved = parsed._replace(netloc=netloc).geturl()
+            print(
+                f"Warning: Prometheus port {original_port} is already in use; "
+                f"falling back to {resolved}",
+                file=sys.stderr,
+            )
+            return resolved
+
+    print(
+        f"Warning: Prometheus ports {original_port}-"
+        f"{original_port + port_fallbacks} are already in use; keeping {prometheus_url}",
+        file=sys.stderr,
+    )
+    return prometheus_url
 
 
 def http_request(method: str, url: str, data: Any = None,
@@ -375,6 +426,12 @@ def backup_monitoring_config(output_dir: str, prometheus_url: str,
 def parse_args():
     parser = argparse.ArgumentParser(description="Monitoring setup tool")
     parser.add_argument("--prometheus-url", default=DEFAULT_PROMETHEUS_URL)
+    parser.add_argument(
+        "--prometheus-port-fallbacks",
+        type=int,
+        default=DEFAULT_PROMETHEUS_PORT_FALLBACKS,
+        help="Number of local Prometheus ports to try after the configured port is busy",
+    )
     parser.add_argument("--alertmanager-url", default=DEFAULT_ALERTMANAGER_URL)
     parser.add_argument("--grafana-url", default=DEFAULT_GRAFANA_URL)
     parser.add_argument("--grafana-api-key", default=os.environ.get("GRAFANA_API_KEY", ""))
@@ -394,6 +451,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.prometheus_url = resolve_prometheus_url(
+        args.prometheus_url,
+        port_fallbacks=args.prometheus_port_fallbacks,
+    )
 
     if args.check:
         print("Checking monitoring infrastructure...")
