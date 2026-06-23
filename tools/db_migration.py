@@ -27,8 +27,10 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -139,20 +141,38 @@ MIGRATIONS: List[Dict[str, Any]] = [
 
 
 def execute_sql(sql: str, db_config: Dict[str, str]) -> bool:
-    psql_env = os.environ.copy()
-    if db_config.get("password"):
-        psql_env["PGPASSWORD"] = db_config["password"]
+    """Execute SQL using psql with .pgpass for secure authentication."""
+    password = db_config.get("password", "")
+    if not password:
+        print("Database password is empty. Set DB_PASSWORD environment variable.", file=sys.stderr)
+        return False
 
-    cmd = [
-        "psql",
-        "-h", db_config["host"],
-        "-p", str(db_config["port"]),
-        "-d", db_config["name"],
-        "-U", db_config["user"],
-        "-c", sql,
-    ]
-
+    pgpass_file = None
+    pgpass_path = None
     try:
+        # Create temporary .pgpass file with restricted permissions
+        fd, pgpass_path = tempfile.mkstemp(prefix=".pgpass_", text=True)
+        pgpass_file = os.fdopen(fd, "w")
+        pgpass_file.write(
+            f"{db_config['host']}:{db_config['port']}:{db_config['name']}"
+            f":{db_config['user']}:{password}\n"
+        )
+        pgpass_file.flush()
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+
+        psql_env = os.environ.copy()
+        psql_env["PGPASSFILE"] = pgpass_path
+
+        cmd = [
+            "psql",
+            "-h", db_config["host"],
+            "-p", str(db_config["port"]),
+            "-d", db_config["name"],
+            "-U", db_config["user"],
+            "-w",  # never prompt for password
+            "-c", sql,
+        ]
+
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=psql_env)
         if result.returncode == 0:
             return True
@@ -164,6 +184,14 @@ def execute_sql(sql: str, db_config: Dict[str, str]) -> bool:
     except FileNotFoundError:
         print("psql not found. Is PostgreSQL client installed?", file=sys.stderr)
         return False
+    finally:
+        if pgpass_file:
+            pgpass_file.close()
+        if pgpass_path:
+            try:
+                os.unlink(pgpass_path)
+            except OSError:
+                pass
 
 
 def apply_migration(version: str, direction: str = "up") -> bool:
