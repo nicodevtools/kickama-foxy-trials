@@ -206,8 +206,6 @@ def apply_migration(version: str, direction: str = "up") -> bool:
     sql_up += f"INSERT INTO {MIGRATION_TABLE} (version, description, applied_at) "
     sql_up += f"VALUES ('{version}', '{migration['description']}', NOW());\n"
 
-    sql_down = f"DELETE FROM {MIGRATION_TABLE} WHERE version = '{version}';\n"
-
     if direction == "up":
         success = execute_sql(sql_up, DB_CONFIG)
         if success:
@@ -216,12 +214,69 @@ def apply_migration(version: str, direction: str = "up") -> bool:
             print(f"  ✗ Migration {version} FAILED")
         return success
     else:
-        success = execute_sql(sql_down, DB_CONFIG)
-        if success:
-            print(f"  ✓ Migration {version} rolled back")
-        else:
-            print(f"  ✗ Migration {version} rollback FAILED")
-        return success
+        # Delegate to the enhanced rollback function
+        return rollback_migration(version, dry_run=False)
+
+
+def rollback_migration(version: str, dry_run: bool = False) -> bool:
+    """Rollback a specific migration with safety checks.
+
+    Verifies:
+    - The migration exists in the migration registry
+    - The migration was previously applied
+    - Captures pre-rollback state for audit
+    """
+    migration = next((m for m in MIGRATIONS if m["version"] == version), None)
+    if not migration:
+        print(f"ERROR: Migration {version} not found in registry. Rollback aborted.")
+        return False
+
+    if not migration.get("applied", False):
+        print(
+            f"ERROR: Migration {version} ('{migration['description']}') "
+            f"has NOT been applied yet. Rollback aborted."
+        )
+        return False
+
+    # Capture pre-rollback state
+    pre_rollback_state = {
+        "version": version,
+        "description": migration["description"],
+        "was_applied": migration["applied"],
+        "timestamp": datetime.now().isoformat(),
+        "action": "rollback",
+    }
+    print(f"Pre-rollback state captured: {json.dumps(pre_rollback_state, indent=2)}")
+
+    if dry_run:
+        print(
+            f"DRY RUN: Would rollback migration {version} "
+            f"('{migration['description']}')"
+        )
+        return True
+
+    print(f"Rolling back migration {version}: {migration['description']}")
+    sql_down = f"DELETE FROM {MIGRATION_TABLE} WHERE version = '{version}';\n"
+    success = execute_sql(sql_down, DB_CONFIG)
+    if success:
+        # Save rollback record
+        rollback_history_path = os.path.join(
+            os.path.dirname(__file__), "..", "migration_rollback_history.json"
+        )
+        history = []
+        if os.path.exists(rollback_history_path):
+            try:
+                with open(rollback_history_path) as f:
+                    history = json.load(f)
+            except json.JSONDecodeError:
+                history = []
+        history.append(pre_rollback_state)
+        with open(rollback_history_path, "w") as f:
+            json.dump(history, f, indent=2)
+        print(f"  ✓ Migration {version} rolled back successfully")
+    else:
+        print(f"  ✗ Migration {version} rollback FAILED")
+    return success
 
 
 def get_migration_status() -> List[Dict[str, Any]]:
@@ -312,7 +367,7 @@ def main():
         if not args.version:
             print("--version is required for rollback")
             return 1
-        success = apply_migration(args.version, "down")
+        success = rollback_migration(args.version, dry_run=args.dry_run)
         return 0 if success else 1
 
     if args.create:

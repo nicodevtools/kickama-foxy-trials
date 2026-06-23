@@ -203,9 +203,14 @@ class NginxLogParser(LogParser):
 # AGGREGATOR
 # ---------------------------------------------------------------------------
 
+MEMORY_WARNING_THRESHOLD = 0.80  # warn at 80% of max_entries
+
+
 class LogAggregator:
-    def __init__(self):
+    def __init__(self, max_entries: int = 100000, stream_mode: bool = False):
         self.parsers = [JSONLogParser(), TextLogParser(), NginxLogParser()]
+        self.max_entries = max_entries
+        self.stream_mode = stream_mode
         self.entries: List[Dict[str, Any]] = []
         self.level_counts: Counter = Counter()
         self.service_counts: Counter = Counter()
@@ -214,6 +219,8 @@ class LogAggregator:
         self.top_errors: Counter = Counter()
         self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
         self._lock = threading.Lock()
+        self._memory_warned = False
+        self._memory_dropped = 0
 
     def process_file(self, filepath: str) -> int:
         parsed_count = 0
@@ -277,6 +284,62 @@ class LogAggregator:
 
         return total
 
+    def _check_memory_limit(self) -> None:
+        """Emit a warning when approaching the max_entries limit."""
+        if self.stream_mode or self.max_entries <= 0:
+            return
+        current = len(self.entries)
+        if current >= self.max_entries:
+            if not self._memory_warned:
+                logger.warning(
+                    f"Memory limit reached: {current}/{self.max_entries} entries. "
+                    f"New entries will be counted but NOT stored. "
+                    f"Use --max-entries to increase the limit or --stream for streaming mode."
+                )
+                self._memory_warned = True
+            return
+        usage_ratio = current / max(self.max_entries, 1)
+        if usage_ratio >= MEMORY_WARNING_THRESHOLD:
+            logger.warning(
+                f"Memory usage high: {current}/{self.max_entries} entries "
+                f"({usage_ratio:.0%} of limit). "
+                f"Consider using --stream mode or increasing --max-entries."
+            )
+
+    def _record_entry(self, entry: Dict[str, Any]) -> bool:
+        """Record a single parsed entry, respecting memory bounds.
+
+        Returns True if the entry was stored, False if it was only counted.
+        """
+        # Always update counters (even in stream mode we count)
+        ts = entry.get('timestamp')
+        if ts:
+            hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
+            self.hourly_counts[hour] += 1
+        level = entry.get('level', 'unknown').lower()
+        self.level_counts[level] += 1
+        service = entry.get('service', 'unknown')
+        self.service_counts[service] += 1
+        if level in ('error', 'critical'):
+            msg = entry.get('message', '')
+            if len(msg) > 200:
+                msg = msg[:200]
+            self.errors_by_service[service].append(msg)
+            self.error_patterns[msg] += 1
+
+        # In stream mode, never store entries
+        if self.stream_mode:
+            return False
+
+        # Check memory limit before storing
+        self._check_memory_limit()
+        if len(self.entries) < self.max_entries:
+            self.entries.append(entry)
+            return True
+        else:
+            self._memory_dropped += 1
+            return False
+
     def _process_file_threadsafe(self, filepath: str) -> int:
         """Process a single file and merge results under a lock (thread-safe)."""
         parsed_count = 0
@@ -304,21 +367,7 @@ class LogAggregator:
         # Merge into shared state under lock
         with self._lock:
             for entry in local_entries:
-                self.entries.append(entry)
-                ts = entry.get('timestamp')
-                if ts:
-                    hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
-                    self.hourly_counts[hour] += 1
-                level = entry.get('level', 'unknown').lower()
-                self.level_counts[level] += 1
-                service = entry.get('service', 'unknown')
-                self.service_counts[service] += 1
-                if level in ('error', 'critical'):
-                    msg = entry.get('message', '')
-                    if len(msg) > 200:
-                        msg = msg[:200]
-                    self.errors_by_service[service].append(msg)
-                    self.error_patterns[msg] += 1
+                self._record_entry(entry)
 
         return parsed_count
 
@@ -326,27 +375,26 @@ class LogAggregator:
         for parser in self.parsers:
             entry = parser.parse(line)
             if entry:
-                self.entries.append(entry)
-                ts = entry.get('timestamp')
-                if ts:
-                    hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
-                    self.hourly_counts[hour] += 1
-                level = entry.get('level', 'unknown').lower()
-                self.level_counts[level] += 1
-                service = entry.get('service', 'unknown')
-                self.service_counts[service] += 1
-                if level in ('error', 'critical'):
-                    msg = entry.get('message', '')
-                    if len(msg) > 200:
-                        msg = msg[:200]
-                    self.errors_by_service[service].append(msg)
-                    self.error_patterns[msg] += 1
+                self._record_entry(entry)
                 return True
         return False
 
+    @property
+    def total_parsed(self) -> int:
+        """Total number of entries parsed (counting stream/dropped)."""
+        return sum(self.level_counts.values())
+
     def get_summary(self) -> Dict[str, Any]:
+        memory_info = {}
+        if not self.stream_mode and self.max_entries > 0:
+            memory_info['stored_entries'] = len(self.entries)
+            memory_info['dropped_entries'] = self._memory_dropped
+            memory_info['memory_usage_pct'] = round(
+                len(self.entries) / max(self.max_entries, 1) * 100, 1
+            )
         return {
-            'total_entries': len(self.entries),
+            'total_entries': max(len(self.entries), self.total_parsed),
+            'streaming_mode': self.stream_mode,
             'time_range': self._get_time_range(),
             'by_level': dict(self.level_counts.most_common()),
             'by_service': dict(self.service_counts.most_common()),
@@ -357,6 +405,7 @@ class LogAggregator:
                 svc: len(errors)
                 for svc, errors in self.errors_by_service.items()
             },
+            'memory': memory_info,
         }
 
     def _get_time_range(self) -> Optional[Dict[str, str]]:
@@ -495,6 +544,8 @@ def parse_args():
     parser.add_argument("--search", help="Search for a string in logs")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers for directory processing")
+    parser.add_argument("--max-entries", type=int, default=100000, help="Maximum entries to store in memory (default: 100000)")
+    parser.add_argument("--stream", action="store_true", help="Streaming mode: count entries without storing them in memory")
     return parser.parse_args()
 
 
@@ -503,7 +554,7 @@ def main():
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    aggregator = LogAggregator()
+    aggregator = LogAggregator(max_entries=args.max_entries, stream_mode=args.stream)
 
     if args.input:
         if '*' in args.input or '?' in args.input:

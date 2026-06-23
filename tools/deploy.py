@@ -343,15 +343,108 @@ def deploy_service(service: str, env: str, tag: str,
     return True
 
 
-def rollback_service(service: str, env: str, version: str) -> bool:
+def rollback_service(service: str, env: str, version: str,
+                   force: bool = False) -> bool:
+    """Rollback a service to a previous version with health verification.
+
+    Pre-rollback checks:
+    - Verifies the target version tag exists (Docker image)
+    - Captures current version and health status
+    - Saves pre-rollback state to deployment history
+    - Optionally skips verification with --force
+    """
     env_config = ENVIRONMENTS.get(env)
     service_config = SERVICES.get(service)
     if not env_config or not service_config:
         return False
 
+    print(f"Preparing rollback of {service} to version {version} in {env}...")
+
+    # --- Pre-rollback: Verify version tag exists ---
+    image_name = f"registry.example.com/tent/{service}:{version}"
+    print(f"Verifying image exists: {image_name}")
+    returncode, output = run_command(
+        ["docker", "manifest", "inspect", image_name], capture=True
+    )
+    if returncode != 0:
+        print(f"WARNING: Image tag '{version}' not found in registry.")
+        if not force:
+            print(
+                f"ERROR: Rollback aborted. The tag '{version}' does not exist "
+                f"in the registry. Use --force to skip this check."
+            )
+            return False
+        else:
+            print("FORCE mode: Skipping tag verification and proceeding anyway.")
+    else:
+        print(f"  ✓ Image tag '{version}' found in registry")
+
+    # --- Pre-rollback: Capture current state ---
+    current_version = _get_current_deployed_version(service, env)
+    current_health = _get_health_status(service, env)
+
+    pre_rollback_state = {
+        "timestamp": datetime.now().isoformat(),
+        "service": service,
+        "environment": env,
+        "current_version": current_version,
+        "current_health": current_health,
+        "target_version": version,
+        "action": "pre_rollback_snapshot",
+        "deployed_by": os.environ.get("USER", "unknown"),
+    }
+
+    print(f"Pre-rollback state:")
+    print(f"  Current version: {current_version}")
+    print(f"  Current health: {current_health}")
+    print(f"  Target version: {version}")
+
+    # Save pre-rollback state to deployment_history
+    history = load_deployment_history(env)
+    history.append(pre_rollback_state)
+    save_deployment_history(env, history)
+    print(f"  ✓ Pre-rollback state saved to .deploy_history_{env}.json")
+
+    if not force and current_health == "healthy":
+        print(
+            f"WARNING: Service {service} is currently healthy. "
+            f"Rollback from a healthy state may be unnecessary. "
+            f"Use --force to proceed anyway."
+        )
+
     print(f"Rolling back {service} to version {version}...")
     return deploy_service(service, env, version,
                           skip_build=True, skip_test=True, skip_health=False)
+
+
+def _get_current_deployed_version(service: str, env: str) -> str:
+    """Get the currently deployed version of a service from deployment history."""
+    history = load_deployment_history(env)
+    for entry in reversed(history):
+        if entry.get("service") == service and entry.get("status") == "success":
+            return entry.get("version", "unknown")
+    return "unknown"
+
+
+def _get_health_status(service: str, env: str) -> str:
+    """Get the current health status of a service."""
+    env_config = ENVIRONMENTS.get(env)
+    service_config = SERVICES.get(service)
+    if not env_config or not service_config:
+        return "unknown"
+
+    host = env_config["host"]
+    port = service_config["port"]
+    endpoint = service_config["health_endpoint"]
+    url = f"http://{host}:{port}{endpoint}"
+
+    returncode, output = run_command(
+        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", url],
+        capture=True
+    )
+    if returncode == 0 and output.strip() == "200":
+        return "healthy"
+    return "unhealthy"
 
 
 def list_deployments(env: str, service: Optional[str] = None):
@@ -381,6 +474,7 @@ def parse_args():
     parser.add_argument("--skip-health", action="store_true", help="Skip health check")
     parser.add_argument("--rollback", action="store_true", help="Rollback instead of deploy")
     parser.add_argument("--version", help="Version to rollback to")
+    parser.add_argument("--force", action="store_true", help="Force rollback, skip health/tag verification")
     parser.add_argument("--list", action="store_true", help="List deployments")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -407,7 +501,8 @@ def main():
             print(f"Would rollback {args.service} in {args.env} to {args.version}")
             return 0
 
-        success = rollback_service(args.service, args.env, args.version)
+        success = rollback_service(args.service, args.env, args.version,
+                                 force=args.force)
         return 0 if success else 1
 
     services = list(SERVICES.keys()) if args.service == "all" else [args.service]
