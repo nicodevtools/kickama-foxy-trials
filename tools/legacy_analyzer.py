@@ -49,9 +49,22 @@ logger = logging.getLogger("legacy_analyzer")
 # PATTERN DEFINITIONS
 # ---------------------------------------------------------------------------
 
+# Shared lint patterns common across all languages.
+# Language-specific patterns extend this base set to avoid duplication.
+_BASE_LINT_PATTERNS: List[Dict[str, Any]] = [
+    {"pattern": r"//\s*TODO|#\s*TODO", "name": "todo_comment", "severity": "info",
+     "description": "TODO comment in code. Should be tracked in issue tracker."},
+    {"pattern": r"//\s*FIXME|#\s*FIXME", "name": "fixme_comment", "severity": "medium",
+     "description": "FIXME comment in code. Known issue that needs fixing."},
+    {"pattern": r"//\s*HACK|#\s*HACK", "name": "hack_comment", "severity": "medium",
+     "description": "HACK comment in code. Workaround that should be properly fixed."},
+    {"pattern": r"//\s*XXX|#\s*XXX", "name": "xxx_comment", "severity": "low",
+     "description": "XXX comment. Something suspicious or unclear."},
+]
+
 # Legacy pattern definitions for detection
 LEGACY_PATTERNS: Dict[str, List[Dict[str, Any]]] = {
-    "rust": [
+    "rust": _BASE_LINT_PATTERNS + [
         {"pattern": r"unsafe\s*\{", "name": "unsafe_block", "severity": "high",
          "description": "Unsafe block detected. Should be reviewed for safety."},
         {"pattern": r"#\[allow\(.*unused.*\)\]", "name": "suppressed_unused_warning", "severity": "medium",
@@ -64,26 +77,12 @@ LEGACY_PATTERNS: Dict[str, List[Dict[str, Any]]] = {
          "description": "Trait with default implementation may indicate over-engineering."},
         {"pattern": r"todo!\(", "name": "todo_macro", "severity": "info",
          "description": "TODO macro left in code. Requires attention."},
-        {"pattern": r"//\s*TODO", "name": "todo_comment", "severity": "info",
-         "description": "TODO comment in code. Should be tracked in issue tracker."},
-        {"pattern": r"//\s*FIXME", "name": "fixme_comment", "severity": "medium",
-         "description": "FIXME comment in code. Known issue that needs fixing."},
-        {"pattern": r"//\s*HACK", "name": "hack_comment", "severity": "medium",
-         "description": "HACK comment in code. Workaround that should be properly fixed."},
-        {"pattern": r"//\s*XXX", "name": "xxx_comment", "severity": "low",
-         "description": "XXX comment. Something suspicious or unclear."},
         {"pattern": r"#\[deprecated\]", "name": "deprecated_item", "severity": "medium",
          "description": "Deprecated item defined. Should be removed in next major version."},
         {"pattern": r"allow\(deprecated\)", "name": "suppressed_deprecation", "severity": "medium",
          "description": "Deprecation warning suppressed. Using deprecated API."},
     ],
-    "go": [
-        {"pattern": r"//\s+TODO", "name": "todo_comment", "severity": "info",
-         "description": "TODO comment in code. Should be tracked."},
-        {"pattern": r"//\s+FIXME", "name": "fixme_comment", "severity": "medium",
-         "description": "FIXME comment in code. Known issue."},
-        {"pattern": r"//\s+HACK", "name": "hack_comment", "severity": "medium",
-         "description": "HACK comment. Workaround that should be fixed."},
+    "go": _BASE_LINT_PATTERNS + [
         {"pattern": r"//\s+Deprecated:", "name": "deprecated_comment", "severity": "low",
          "description": "Deprecated function/type."},
         {"pattern": r"reflect\.\w+", "name": "reflection_usage", "severity": "medium",
@@ -95,9 +94,7 @@ LEGACY_PATTERNS: Dict[str, List[Dict[str, Any]]] = {
         {"pattern": r"time\.Sleep\(", "name": "time_sleep", "severity": "low",
          "description": "time.Sleep() used. Consider using time.After or ticker."},
     ],
-    "typescript": [
-        {"pattern": r"//\s*TODO", "name": "todo_comment", "severity": "info"},
-        {"pattern": r"//\s*FIXME", "name": "fixme_comment", "severity": "medium"},
+    "typescript": _BASE_LINT_PATTERNS + [
         {"pattern": r"@deprecated", "name": "deprecated_tag", "severity": "medium",
          "description": "Deprecated JSDoc tag."},
         {"pattern": r":\s*any\b", "name": "any_type", "severity": "medium",
@@ -113,9 +110,7 @@ LEGACY_PATTERNS: Dict[str, List[Dict[str, Any]]] = {
         {"pattern": r"console\.log\(", "name": "console_log", "severity": "low",
          "description": "Console log left in code."},
     ],
-    "c_cpp": [
-        {"pattern": r"//\s*TODO", "name": "todo_comment", "severity": "info"},
-        {"pattern": r"//\s*FIXME", "name": "fixme_comment", "severity": "medium"},
+    "c_cpp": _BASE_LINT_PATTERNS + [
         {"pattern": r"#define\s+\w+\s+\d+", "name": "magic_number", "severity": "low",
          "description": "Magic number defined as macro. Consider const/constexpr."},
         {"pattern": r"malloc\s*\(", "name": "malloc_usage", "severity": "medium",
@@ -129,10 +124,7 @@ LEGACY_PATTERNS: Dict[str, List[Dict[str, Any]]] = {
         {"pattern": r"printf\s*\(", "name": "printf_usage", "severity": "low",
          "description": "printf() in non-debug code."},
     ],
-    "python": [
-        {"pattern": r"#\s*TODO", "name": "todo_comment", "severity": "info"},
-        {"pattern": r"#\s*FIXME", "name": "fixme_comment", "severity": "medium"},
-        {"pattern": r"#\s*HACK", "name": "hack_comment", "severity": "medium"},
+    "python": _BASE_LINT_PATTERNS + [
         {"pattern": r"except\s*:", "name": "bare_except", "severity": "high",
          "description": "Bare except clause catches all exceptions, including SystemExit."},
         {"pattern": r"except\s+Exception,?\s*:", "name": "broad_except", "severity": "medium",
