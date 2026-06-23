@@ -28,6 +28,8 @@ Usage:
     python3 health_check.py --service backend # Check specific service
     python3 health_check.py --json            # JSON output
     python3 health_check.py --watch           # Continuous monitoring
+    python3 health_check.py --timeout 10      # Global timeout override
+    python3 health_check.py --probe-rate 5    # Max 5 probes per second
 """
 
 import argparse
@@ -38,7 +40,10 @@ import ssl
 import subprocess
 import sys
 import time
+import threading
+from collections import deque
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -63,6 +68,146 @@ DISK_THRESHOLD_CRITICAL = 90
 
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
+
+# ---------------------------------------------------------------------------
+# CIRCUIT BREAKER
+# ---------------------------------------------------------------------------
+
+class CircuitState(Enum):
+    CLOSED = "CLOSED"           # Normal operation, probes pass through
+    OPEN = "OPEN"               # Circuit tripped, probes are blocked
+    HALF_OPEN = "HALF_OPEN"     # Testing if service has recovered
+
+
+class CircuitBreaker:
+    """Circuit breaker that tracks per-service failure counts and
+    transitions between CLOSED → OPEN → HALF_OPEN → CLOSED states."""
+
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 30.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._state: CircuitState = CircuitState.CLOSED
+        self._failure_count: int = 0
+        self._last_failure_time: float = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def state(self) -> CircuitState:
+        with self._lock:
+            return self._state
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            if self._state == CircuitState.HALF_OPEN:
+                self._state = CircuitState.CLOSED
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            if self._failure_count >= self.failure_threshold or self._state == CircuitState.HALF_OPEN:
+                self._state = CircuitState.OPEN
+
+    def allow_request(self) -> bool:
+        """Return True if a probe should be allowed through the circuit breaker."""
+        with self._lock:
+            if self._state == CircuitState.CLOSED:
+                return True
+            if self._state == CircuitState.OPEN:
+                elapsed = time.time() - self._last_failure_time
+                if elapsed >= self.recovery_timeout:
+                    self._state = CircuitState.HALF_OPEN
+                    return True
+                return False
+            # HALF_OPEN — allow a single trial probe
+            return True
+
+    def to_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "state": self._state.value,
+                "failure_count": self._failure_count,
+                "failure_threshold": self.failure_threshold,
+                "recovery_timeout_s": self.recovery_timeout,
+            }
+
+
+# ---------------------------------------------------------------------------
+# TOKEN BUCKET RATE LIMITER
+# ---------------------------------------------------------------------------
+
+class TokenBucket:
+    """Token bucket rate limiter. Tokens refill at a configurable rate.
+    Each probe consumes one token. When the bucket is empty, probes are
+    throttled (must wait)."""
+
+    def __init__(self, rate: float, capacity: Optional[float] = None):
+        """
+        Args:
+            rate: Tokens per second (sustained rate).
+            capacity: Maximum burst size in tokens (defaults to rate).
+        """
+        self.rate = float(rate)
+        self.capacity = capacity if capacity is not None else self.rate
+        self._tokens: float = self.capacity
+        self._last_refill: float = time.monotonic()
+        self._lock = threading.Lock()
+        # Statistics
+        self.total_probes: int = 0
+        self.throttled_probes: int = 0
+        self.total_wait_time: float = 0.0
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+        self._last_refill = now
+
+    def consume(self, tokens: float = 1.0) -> Tuple[bool, float]:
+        """Try to consume tokens. Returns (allowed, wait_time).
+        If not enough tokens, wait_time is the seconds until next token."""
+        with self._lock:
+            self._refill()
+            self.total_probes += 1
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return True, 0.0
+            else:
+                self.throttled_probes += 1
+                wait_time = (tokens - self._tokens) / self.rate
+                self.total_wait_time += wait_time
+                # Consume what we can and the rest will be "borrowed"
+                self._tokens -= tokens
+                return False, wait_time
+
+    @property
+    def current_rate(self) -> float:
+        """Current effective rate (tokens available now)."""
+        with self._lock:
+            self._refill()
+            return min(self.rate, self._tokens)
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "rate_per_second": self.rate,
+                "current_tokens": round(self._tokens, 2),
+                "capacity": self.capacity,
+                "total_probes": self.total_probes,
+                "throttled_probes": self.throttled_probes,
+                "throttle_pct": round(
+                    (self.throttled_probes / max(1, self.total_probes)) * 100, 1
+                ),
+                "total_wait_time_s": round(self.total_wait_time, 3),
+            }
+
+    def set_rate(self, rate: float) -> None:
+        """Update the sustained rate (used for half-open reduction)."""
+        with self._lock:
+            self.rate = float(rate)
+            self.capacity = max(self.capacity, self.rate)
+
 
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
@@ -197,10 +342,15 @@ def check_load_average() -> Tuple[str, str, float]:
 
 
 # ---------------------------------------------------------------------------
-# HEALTH CHECK RUNNER
+# HEALTH CHECK RUNNER WITH RATE LIMITING & CIRCUIT BREAKER
 # ---------------------------------------------------------------------------
 
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+def run_health_checks(
+    service: Optional[str] = None,
+    json_output: bool = False,
+    global_timeout: Optional[int] = None,
+    probe_rate: Optional[int] = None,
+) -> Dict[str, Any]:
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
@@ -208,7 +358,19 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
         "infrastructure": {},
         "system": {},
         "overall_status": "OK",
+        "rate_limiter": {},
+        "circuit_breakers": {},
     }
+
+    # Per-service circuit breakers
+    circuit_breakers: Dict[str, CircuitBreaker] = {
+        name: CircuitBreaker() for name in list(SERVICES.keys()) + list(INFRASTRUCTURE.keys())
+    }
+
+    # Global token bucket rate limiter
+    limiter: Optional[TokenBucket] = None
+    if probe_rate and probe_rate > 0:
+        limiter = TokenBucket(rate=float(probe_rate))
 
     all_ok = True
 
@@ -216,30 +378,114 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     for name, config in SERVICES.items():
         if service and name != service:
             continue
+
+        cb = circuit_breakers[name]
+
+        # Determine effective timeout
+        effective_timeout = config["timeout"]
+        if global_timeout is not None:
+            effective_timeout = global_timeout
+
+        # Rate limit: reduce rate to 50% when circuit breaker is HALF_OPEN
+        effective_rate = probe_rate
+        if limiter is not None and cb.state == CircuitState.HALF_OPEN:
+            half_rate = max(1, probe_rate // 2)
+            limiter.set_rate(float(half_rate))
+
+        # Circuit breaker gate
+        if not cb.allow_request():
+            results["services"][name] = {
+                "status": "CRITICAL",
+                "detail": "Circuit breaker OPEN — probe blocked",
+                "code": 0,
+                "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
+                "circuit_breaker": cb.to_dict(),
+            }
+            all_ok = False
+            continue
+
+        # Rate limiter gate
+        throttled = False
+        if limiter is not None:
+            allowed, wait_time = limiter.consume()
+            if not allowed:
+                throttled = True
+                time.sleep(min(wait_time, 1.0))
+
         status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], config["timeout"]
+            config["host"], config["port"], config["path"], effective_timeout
         )
+
+        if status == "CRITICAL":
+            cb.record_failure()
+            all_ok = False
+        else:
+            cb.record_success()
+
         results["services"][name] = {
             "status": status,
             "detail": detail,
             "code": code,
             "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
+            "timeout_used_s": effective_timeout,
+            "throttled": throttled,
+            "circuit_breaker": cb.to_dict(),
         }
-        if status == "CRITICAL":
-            all_ok = False
+
+        # Restore original rate after half-open probe
+        if limiter is not None and cb.state == CircuitState.HALF_OPEN and probe_rate:
+            limiter.set_rate(float(probe_rate))
 
     # Check infrastructure
     for name, config in INFRASTRUCTURE.items():
         if service and name != service:
             continue
-        status, detail, latency = check_tcp_port(config["host"], config["port"], config["timeout"])
+
+        cb = circuit_breakers[name]
+
+        effective_timeout = config["timeout"]
+        if global_timeout is not None:
+            effective_timeout = global_timeout
+
+        if limiter is not None and cb.state == CircuitState.HALF_OPEN:
+            half_rate = max(1, (probe_rate or 1) // 2)
+            limiter.set_rate(float(half_rate))
+
+        if not cb.allow_request():
+            results["infrastructure"][name] = {
+                "status": "CRITICAL",
+                "detail": "Circuit breaker OPEN — probe blocked",
+                "endpoint": f"{config['host']}:{config['port']}",
+                "circuit_breaker": cb.to_dict(),
+            }
+            all_ok = False
+            continue
+
+        throttled = False
+        if limiter is not None:
+            allowed, wait_time = limiter.consume()
+            if not allowed:
+                throttled = True
+                time.sleep(min(wait_time, 1.0))
+
+        status, detail, latency = check_tcp_port(config["host"], config["port"], effective_timeout)
+        if status == "CRITICAL":
+            cb.record_failure()
+            all_ok = False
+        else:
+            cb.record_success()
+
         results["infrastructure"][name] = {
             "status": status,
             "detail": detail,
             "endpoint": f"{config['host']}:{config['port']}",
+            "timeout_used_s": effective_timeout,
+            "throttled": throttled,
+            "circuit_breaker": cb.to_dict(),
         }
-        if status == "CRITICAL":
-            all_ok = False
+
+        if limiter is not None and probe_rate and cb.state == CircuitState.HALF_OPEN:
+            limiter.set_rate(float(probe_rate))
 
     # Check system resources
     disk_status, disk_detail, disk_pct = check_disk_usage()
@@ -269,6 +515,16 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
             if cert_status == "CRITICAL":
                 all_ok = False
 
+    # Attach rate limiter stats
+    if limiter is not None:
+        results["rate_limiter"] = limiter.stats()
+
+    # Attach circuit breaker states
+    results["circuit_breakers"] = {
+        name: cb.to_dict() for name, cb in circuit_breakers.items()
+        if name in results.get("services", {}) or name in results.get("infrastructure", {})
+    }
+
     results["overall_status"] = "OK" if all_ok else "DEGRADED"
 
     return results
@@ -282,6 +538,14 @@ def print_health_report(results: Dict[str, Any]):
     print(f"  Overall: {results['overall_status']}")
     print(f"{'='*60}")
 
+    # Rate limiter section
+    rl = results.get("rate_limiter", {})
+    if rl:
+        print(f"\n  Rate Limiter:")
+        print(f"    Configured rate: {rl.get('rate_per_second', 'N/A')} probes/sec")
+        print(f"    Throttled: {rl.get('throttled_probes', 0)} of {rl.get('total_probes', 0)} probes ({rl.get('throttle_pct', 0)}%)")
+        print(f"    Current effective rate: {rl.get('current_tokens', 'N/A')} tokens")
+
     for category, items in [("Services", results["services"]),
                              ("Infrastructure", results["infrastructure"]),
                              ("System", results["system"])]:
@@ -289,13 +553,19 @@ def print_health_report(results: Dict[str, Any]):
             print(f"\n  {category}:")
             for name, check in items.items():
                 if isinstance(check, dict) and "status" in check:
-                    status_icon = {"OK": "✓", "WARNING": "⚠", "CRITICAL": "✗"}.get(check["status"], "?")
-                    print(f"    {status_icon} {name}: {check['detail']}")
+                    status_icon = {"OK": "\u2713", "WARNING": "\u26a0", "CRITICAL": "\u2717"}.get(check["status"], "?")
+                    extra = ""
+                    if check.get("throttled"):
+                        extra += " [throttled]"
+                    cb_state = (check.get("circuit_breaker") or {}).get("state", "")
+                    if cb_state and cb_state != "CLOSED":
+                        extra += f" [CB:{cb_state}]"
+                    print(f"    {status_icon} {name}: {check['detail']}{extra}")
                 else:
                     print(f"    {name}:")
                     for sub_name, sub_check in check.items():
                         if isinstance(sub_check, dict) and "status" in sub_check:
-                            sub_icon = {"OK": "✓", "WARNING": "⚠", "CRITICAL": "✗"}.get(sub_check["status"], "?")
+                            sub_icon = {"OK": "\u2713", "WARNING": "\u26a0", "CRITICAL": "\u2717"}.get(sub_check["status"], "?")
                             print(f"      {sub_icon} {sub_name}: {sub_check['detail']}")
     print()
 
@@ -307,6 +577,18 @@ def parse_args():
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
+    parser.add_argument(
+        "--timeout", "-t",
+        type=int,
+        default=None,
+        help="Global timeout in seconds for all probes (overrides per-service defaults)",
+    )
+    parser.add_argument(
+        "--probe-rate", "-r",
+        type=int,
+        default=None,
+        help="Maximum probes per second (token bucket rate limiter)",
+    )
     return parser.parse_args()
 
 
@@ -317,7 +599,11 @@ def main():
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
+                results = run_health_checks(
+                    args.service, args.json,
+                    global_timeout=args.timeout,
+                    probe_rate=args.probe_rate,
+                )
                 if args.json:
                     print(json.dumps(results, indent=2))
                 else:
@@ -326,7 +612,11 @@ def main():
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
+        results = run_health_checks(
+            args.service, args.json,
+            global_timeout=args.timeout,
+            probe_rate=args.probe_rate,
+        )
         if args.json:
             output = json.dumps(results, indent=2)
             print(output)
@@ -335,10 +625,7 @@ def main():
 
         if args.output:
             with open(args.output, "w") as f:
-                if args.json:
-                    json.dump(results, f, indent=2)
-                else:
-                    json.dump(results, f, indent=2)
+                json.dump(results, f, indent=2)
             print(f"Report saved to {args.output}")
 
         if results["overall_status"] == "DEGRADED":
