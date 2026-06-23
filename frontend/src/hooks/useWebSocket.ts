@@ -185,6 +185,7 @@ export function useWebSocket(options: WSOptions) {
 
       ws.onopen = (event) => {
         if (!mountedRef.current) return;
+        // Reset exponential backoff on successful connection
         reconnectAttemptRef.current = 0;
         updateState({ connectionState: 'connected', reconnectAttempt: 0 });
 
@@ -263,8 +264,19 @@ export function useWebSocket(options: WSOptions) {
 
       ws.onerror = (event) => {
         if (!mountedRef.current) return;
-        updateState(prev => ({ ...prev, errors: prev.errors + 1, connectionState: 'error' }));
+        updateState(prev => ({
+          ...prev,
+          errors: prev.errors + 1,
+          connectionState: 'error',
+        }));
         mergedOptions.onError?.(event);
+        // Error may occur without a close event — explicitly schedule reconnect
+        // to ensure recovery if the socket fails without closing cleanly.
+        if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+          wsRef.current = null;
+          stopPing();
+          scheduleReconnect();
+        }
       };
     } catch (err) {
       if (!mountedRef.current) return;
