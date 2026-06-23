@@ -43,6 +43,8 @@ export interface CacheEntry<T> {
   ttl: number;
   etag?: string;
   staleWhileRevalidate?: boolean;
+  /** Last-write-wins: timestamp of the most recent write to this key */
+  lastWriteTimestamp?: number;
 }
 
 export interface DataServiceConfig {
@@ -257,22 +259,29 @@ export class DataService {
     // Clear relevant caches before placing order
     this.invalidateCache('/orders');
     this.invalidateCache('/portfolio');
+    // Stamp write timestamp for last-write-wins conflict detection
+    this.markWriteTimestamp('/orders');
+    this.markWriteTimestamp('/portfolio');
     return post('/orders', order).then(res => res.data);
   }
 
   async cancelOrder(orderId: string): Promise<unknown> {
     this.invalidateCache('/orders');
     this.invalidateCache('/portfolio');
+    this.markWriteTimestamp('/orders');
+    this.markWriteTimestamp('/portfolio');
     return del(`/orders/${orderId}`).then(res => res.data);
   }
 
   async updateOrder(orderId: string, updates: unknown): Promise<unknown> {
     this.invalidateCache('/orders');
+    this.markWriteTimestamp('/orders');
     return put(`/orders/${orderId}`, updates).then(res => res.data);
   }
 
   async updatePreferences(prefs: unknown): Promise<unknown> {
     this.invalidateCache('/user/preferences');
+    this.markWriteTimestamp('/user/preferences');
     return put('/user/preferences', prefs).then(res => res.data);
   }
 
@@ -372,7 +381,21 @@ export class DataService {
 
   private async fetchAndCache<T>(url: string, cacheKey: string, ttl: number): Promise<T> {
     try {
+      const writeTsBeforeFetch = Date.now();
       const response = await this.fetchWithRetry(url);
+
+      // Last-write-wins: check if a write occurred while fetch was in-flight
+      const existing = this.cache.get(cacheKey);
+      if (existing?.lastWriteTimestamp && existing.lastWriteTimestamp > writeTsBeforeFetch) {
+        // A concurrent write happened — skip caching stale read, return fresh data anyway
+        if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {
+          console.warn(
+            `[DataService] Conflict detected for "${url}": write happened during fetch. Returning fetched data but not caching.`
+          );
+        }
+        return response;
+      }
+
       const entry: CacheEntry<T> = {
         data: response,
         timestamp: Date.now(),
@@ -443,6 +466,21 @@ export class DataService {
         if (this.config.enableLocalStorage) {
           localStorage.removeItem(key);
         }
+      }
+    }
+  }
+
+  /**
+   * Mark cache entries matching a pattern with the current timestamp.
+   * This enables last-write-wins conflict detection: if a fetch completes
+   * after a write started, the fetched data will not overwrite the cache
+   * (because a fresher write already invalidated/updated it).
+   */
+  private markWriteTimestamp(pattern: string): void {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries) {
+      if (key.includes(pattern)) {
+        entry.lastWriteTimestamp = now;
       }
     }
   }
