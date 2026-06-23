@@ -89,6 +89,7 @@ class CircuitBreaker:
         self._state: CircuitState = CircuitState.CLOSED
         self._failure_count: int = 0
         self._last_failure_time: float = 0.0
+        self._half_open_probe_allowed: bool = False
         self._lock = threading.Lock()
 
     @property
@@ -118,10 +119,16 @@ class CircuitBreaker:
                 elapsed = time.time() - self._last_failure_time
                 if elapsed >= self.recovery_timeout:
                     self._state = CircuitState.HALF_OPEN
+                    self._half_open_probe_allowed = True
                     return True
                 return False
-            # HALF_OPEN — allow a single trial probe
-            return True
+            # HALF_OPEN — allow a single trial probe only
+            if self._state == CircuitState.HALF_OPEN:
+                if not getattr(self, '_half_open_probe_allowed', False):
+                    self._half_open_probe_allowed = True
+                    return True
+                return False
+            return False
 
     def to_dict(self) -> Dict[str, Any]:
         with self._lock:
@@ -148,8 +155,12 @@ class TokenBucket:
             rate: Tokens per second (sustained rate).
             capacity: Maximum burst size in tokens (defaults to rate).
         """
+        if float(rate) <= 0:
+            raise ValueError(f"Rate must be positive, got {rate}")
         self.rate = float(rate)
         self.capacity = capacity if capacity is not None else self.rate
+        if self.capacity < self.rate:
+            self.capacity = self.rate
         self._tokens: float = self.capacity
         self._last_refill: float = time.monotonic()
         self._lock = threading.Lock()
@@ -167,6 +178,8 @@ class TokenBucket:
     def consume(self, tokens: float = 1.0) -> Tuple[bool, float]:
         """Try to consume tokens. Returns (allowed, wait_time).
         If not enough tokens, wait_time is the seconds until next token."""
+        if float(tokens) <= 0:
+            raise ValueError(f"Tokens must be positive, got {tokens}")
         with self._lock:
             self._refill()
             self.total_probes += 1
@@ -204,6 +217,8 @@ class TokenBucket:
 
     def set_rate(self, rate: float) -> None:
         """Update the sustained rate (used for half-open reduction)."""
+        if float(rate) <= 0:
+            raise ValueError(f"Rate must be positive, got {rate}")
         with self._lock:
             self.rate = float(rate)
             self.capacity = max(self.capacity, self.rate)
@@ -350,6 +365,9 @@ def run_health_checks(
     json_output: bool = False,
     global_timeout: Optional[int] = None,
     probe_rate: Optional[int] = None,
+    max_retries: int = 0,
+    backoff_factor: float = 1.0,
+    circuit_breakers: Optional[Dict[str, CircuitBreaker]] = None,
 ) -> Dict[str, Any]:
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
@@ -362,10 +380,13 @@ def run_health_checks(
         "circuit_breakers": {},
     }
 
-    # Per-service circuit breakers
-    circuit_breakers: Dict[str, CircuitBreaker] = {
-        name: CircuitBreaker() for name in list(SERVICES.keys()) + list(INFRASTRUCTURE.keys())
-    }
+    # Per-service circuit breakers — reuse if passed externally
+    if circuit_breakers is not None:
+        cb_map = circuit_breakers
+    else:
+        cb_map = {
+            name: CircuitBreaker() for name in list(SERVICES.keys()) + list(INFRASTRUCTURE.keys())
+        }
 
     # Global token bucket rate limiter
     limiter: Optional[TokenBucket] = None
@@ -379,18 +400,12 @@ def run_health_checks(
         if service and name != service:
             continue
 
-        cb = circuit_breakers[name]
+        cb = cb_map[name]
 
         # Determine effective timeout
         effective_timeout = config["timeout"]
         if global_timeout is not None:
             effective_timeout = global_timeout
-
-        # Rate limit: reduce rate to 50% when circuit breaker is HALF_OPEN
-        effective_rate = probe_rate
-        if limiter is not None and cb.state == CircuitState.HALF_OPEN:
-            half_rate = max(1, probe_rate // 2)
-            limiter.set_rate(float(half_rate))
 
         # Circuit breaker gate
         if not cb.allow_request():
@@ -404,6 +419,12 @@ def run_health_checks(
             all_ok = False
             continue
 
+        # Rate limit: reduce rate to 50% when circuit breaker transitions to HALF_OPEN
+        # This must happen AFTER allow_request() which performs the transition
+        if limiter is not None and cb.state == CircuitState.HALF_OPEN and probe_rate:
+            half_rate = max(1, probe_rate // 2)
+            limiter.set_rate(float(half_rate))
+
         # Rate limiter gate
         throttled = False
         if limiter is not None:
@@ -412,8 +433,12 @@ def run_health_checks(
                 throttled = True
                 time.sleep(min(wait_time, 1.0))
 
-        status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], effective_timeout
+        # Probe with retry/backoff
+        status, detail, code = _probe_with_retry(
+            lambda: check_http_service(
+                config["host"], config["port"], config["path"], effective_timeout
+            ),
+            max_retries, backoff_factor,
         )
 
         if status == "CRITICAL":
@@ -433,7 +458,7 @@ def run_health_checks(
         }
 
         # Restore original rate after half-open probe
-        if limiter is not None and cb.state == CircuitState.HALF_OPEN and probe_rate:
+        if limiter is not None and probe_rate and cb.state == CircuitState.HALF_OPEN:
             limiter.set_rate(float(probe_rate))
 
     # Check infrastructure
@@ -441,15 +466,11 @@ def run_health_checks(
         if service and name != service:
             continue
 
-        cb = circuit_breakers[name]
+        cb = cb_map[name]
 
         effective_timeout = config["timeout"]
         if global_timeout is not None:
             effective_timeout = global_timeout
-
-        if limiter is not None and cb.state == CircuitState.HALF_OPEN:
-            half_rate = max(1, (probe_rate or 1) // 2)
-            limiter.set_rate(float(half_rate))
 
         if not cb.allow_request():
             results["infrastructure"][name] = {
@@ -461,6 +482,11 @@ def run_health_checks(
             all_ok = False
             continue
 
+        # Rate reduction AFTER allow_request (which transitions to HALF_OPEN)
+        if limiter is not None and cb.state == CircuitState.HALF_OPEN and probe_rate:
+            half_rate = max(1, (probe_rate or 1) // 2)
+            limiter.set_rate(float(half_rate))
+
         throttled = False
         if limiter is not None:
             allowed, wait_time = limiter.consume()
@@ -468,7 +494,7 @@ def run_health_checks(
                 throttled = True
                 time.sleep(min(wait_time, 1.0))
 
-        status, detail, latency = check_tcp_port(config["host"], config["port"], effective_timeout)
+        status, detail, _latency = check_tcp_port(config["host"], config["port"], effective_timeout)
         if status == "CRITICAL":
             cb.record_failure()
             all_ok = False
@@ -521,7 +547,7 @@ def run_health_checks(
 
     # Attach circuit breaker states
     results["circuit_breakers"] = {
-        name: cb.to_dict() for name, cb in circuit_breakers.items()
+        name: cb.to_dict() for name, cb in cb_map.items()
         if name in results.get("services", {}) or name in results.get("infrastructure", {})
     }
 
@@ -541,7 +567,7 @@ def print_health_report(results: Dict[str, Any]):
     # Rate limiter section
     rl = results.get("rate_limiter", {})
     if rl:
-        print(f"\n  Rate Limiter:")
+        print("\n  Rate Limiter:")
         print(f"    Configured rate: {rl.get('rate_per_second', 'N/A')} probes/sec")
         print(f"    Throttled: {rl.get('throttled_probes', 0)} of {rl.get('total_probes', 0)} probes ({rl.get('throttle_pct', 0)}%)")
         print(f"    Current effective rate: {rl.get('current_tokens', 'N/A')} tokens")
@@ -589,11 +615,47 @@ def parse_args():
         default=None,
         help="Maximum probes per second (token bucket rate limiter)",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=0,
+        help="Maximum retries per probe with exponential backoff",
+    )
+    parser.add_argument(
+        "--backoff-factor",
+        type=float,
+        default=1.0,
+        help="Backoff multiplier in seconds for retry delay",
+    )
     return parser.parse_args()
+
+
+def _probe_with_retry(
+    probe_fn, max_retries: int, backoff_factor: float
+) -> Tuple[str, str, int]:
+    """Execute a probe function with retry and exponential backoff."""
+    last_status, last_detail, last_code = "CRITICAL", "", 0
+    for attempt in range(max_retries + 1):
+        status, detail, code = probe_fn()
+        if status != "CRITICAL":
+            return status, detail, code
+        last_status, last_detail, last_code = status, detail, code
+        if attempt < max_retries:
+            delay = backoff_factor * (2 ** attempt)
+            time.sleep(min(delay, 30.0))
+    return last_status, last_detail, last_code
 
 
 def main():
     args = parse_args()
+
+    # Persistent circuit breakers for watch mode
+    persistent_cbs: Optional[Dict[str, CircuitBreaker]] = None
+    if args.watch:
+        persistent_cbs = {
+            name: CircuitBreaker()
+            for name in list(SERVICES.keys()) + list(INFRASTRUCTURE.keys())
+        }
 
     if args.watch:
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
@@ -603,6 +665,9 @@ def main():
                     args.service, args.json,
                     global_timeout=args.timeout,
                     probe_rate=args.probe_rate,
+                    max_retries=args.max_retries,
+                    backoff_factor=args.backoff_factor,
+                    circuit_breakers=persistent_cbs,
                 )
                 if args.json:
                     print(json.dumps(results, indent=2))
@@ -616,6 +681,8 @@ def main():
             args.service, args.json,
             global_timeout=args.timeout,
             probe_rate=args.probe_rate,
+            max_retries=args.max_retries,
+            backoff_factor=args.backoff_factor,
         )
         if args.json:
             output = json.dumps(results, indent=2)
