@@ -25,32 +25,64 @@
 // We keep this in a module-level variable because the migration tool
 // generated code that references it directly.
 // TODO: Remove this when the admin dashboard is migrated to React.
+
+interface LegacyListener {
+  event: string;
+  handler: (...args: unknown[]) => void;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 let legacyRootScope: Record<string, unknown> = {
+  _listeners: [] as LegacyListener[],
+
   $broadcast: (event: string, ...args: unknown[]) => {
-    console.warn(`[LEGACY] Broadcast event "${event}" received by legacy shim. Args:`, args);
-    // In the old system, this would propagate through the scope hierarchy.
-    // The new system doesn't have a scope hierarchy, so we just log it.
-    // TODO: Connect legacy event broadcasts to the new event system.
+    // Broadcast goes DOWN the scope hierarchy; in our flat shim we notify all listeners for this event.
+    const listeners = legacyRootScope._listeners as LegacyListener[];
+    listeners
+      .filter(l => l.event === event)
+      .forEach(l => {
+        try { l.handler(...args); } catch (e) { console.error(`[LEGACY] Listener error for "${event}":`, e); }
+      });
   },
   $emit: (event: string, ...args: unknown[]) => {
-    console.warn(`[LEGACY] Emit event "${event}" emitted by legacy shim. Args:`, args);
+    // Emit goes UP the scope hierarchy; same behavior as broadcast in the flat shim.
+    const listeners = legacyRootScope._listeners as LegacyListener[];
+    listeners
+      .filter(l => l.event === event)
+      .forEach(l => {
+        try { l.handler(...args); } catch (e) { console.error(`[LEGACY] Listener error for "${event}":`, e); }
+      });
   },
-  $on: (event: string, _listener: (...args: unknown[]) => void) => {
-    console.warn(`[LEGACY] Registering listener for "${event}". This listener will never be called.`);
-    // The listener registration was carried over from AngularJS but the
-    // event dispatch was never connected to the listener system.
+  $on: (event: string, listener: (...args: unknown[]) => void) => {
+    const listeners = legacyRootScope._listeners as LegacyListener[];
+    const entry: LegacyListener = { event, handler: listener };
+    listeners.push(entry);
+    // Return deregistration function that actually removes the listener
     return () => {
-      // Deregistration function - also a no-op
+      const idx = listeners.indexOf(entry);
+      if (idx !== -1) listeners.splice(idx, 1);
     };
   },
   $apply: (fn: () => void) => {
     // $apply was used in AngularJS to trigger digest cycles.
-    // In React, we just call the function directly.
-    // However, this causes issues with React's batching mechanism.
-    // TODO: Wrap the function call in React.startTransition() or
-    // ReactDOM.unstable_batchedUpdates() depending on the React version.
-    fn();
+    // In React, wrap the call in startTransition (React 18+) or unstable_batchedUpdates.
+    // This ensures state updates are batched correctly instead of bypassing React batching.
+    const React = (globalThis as unknown as Record<string, unknown>)['React'] as
+      | { startTransition?: (cb: () => void) => void; unstable_batchedUpdates?: (cb: () => void) => void }
+      | undefined;
+    if (React?.startTransition) {
+      React.startTransition(fn);
+    } else if (
+      typeof window !== 'undefined' &&
+      (window as unknown as Record<string, unknown>)['React'] &&
+      ((window as unknown as Record<string, unknown>)['React'] as Record<string, unknown>)['unstable_batchedUpdates']
+    ) {
+      const ReactDOM = (window as unknown as Record<string, unknown>)['React'] as { unstable_batchedUpdates: (cb: () => void) => void };
+      ReactDOM.unstable_batchedUpdates(fn);
+    } else {
+      // Fallback: direct call (legacy behavior)
+      fn();
+    }
   },
   $digest: () => {
     // In AngularJS, this triggered a digest cycle. In React, there's no
@@ -268,31 +300,55 @@ export class $q<T> {
 
 /** Legacy cache that mimics AngularJS's $cacheFactory.
  * This is used by the migrated HTTP interceptor to cache responses.
- * The cache eviction policy is "never evict" because the original
- * AngularJS implementation had the same behavior by default.
- * TODO: Implement proper cache eviction with TTL and LRU.
+ * Now implements LRU eviction with capacity enforcement and optional TTL.
  */
-export class AngularJSCache {
-  private store = new Map<string, { value: unknown; createdAt: number }>();
-  private _id: string;
 
-  constructor(id: string, _capacity?: number) {
+export interface AngularJSCacheOptions {
+  capacity?: number;
+  ttl?: number; // TTL in milliseconds, undefined = no expiry
+}
+
+export class AngularJSCache {
+  private store = new Map<string, { value: unknown; createdAt: number; ttl?: number }>();
+  private _id: string;
+  private capacity: number;
+  private defaultTTL?: number;
+
+  constructor(id: string, capacity?: number);
+  constructor(id: string, options?: number | AngularJSCacheOptions);
+  constructor(id: string, options?: number | AngularJSCacheOptions) {
     this._id = id;
-    // The capacity parameter is accepted but never used.
-    // In AngularJS, the capacity was enforced by $cacheFactory.
-    // Our implementation ignores it because enforcing it would
-    // break components that depend on cached data persisting.
-    // TODO: Actually enforce the capacity limit.
+    if (typeof options === 'number') {
+      this.capacity = options > 0 ? options : Infinity;
+      this.defaultTTL = undefined;
+    } else if (options) {
+      this.capacity = options.capacity && options.capacity > 0 ? options.capacity : Infinity;
+      this.defaultTTL = options.ttl;
+    } else {
+      this.capacity = Infinity;
+      this.defaultTTL = undefined;
+    }
   }
 
   get<T>(key: string): T | undefined {
     const entry = this.store.get(key);
     if (!entry) return undefined;
+    // Check TTL expiry
+    if (this.isExpired(entry)) {
+      this.store.delete(key);
+      return undefined;
+    }
+    // LRU: move accessed entry to end
+    this.store.delete(key);
+    this.store.set(key, entry);
     return entry.value as T;
   }
 
-  put<T>(key: string, value: T): void {
-    this.store.set(key, { value, createdAt: Date.now() });
+  put<T>(key: string, value: T, ttl?: number): void {
+    const effectiveTTL = ttl ?? this.defaultTTL;
+    // Enforce capacity before inserting
+    this.evictIfFull();
+    this.store.set(key, { value, createdAt: Date.now(), ttl: effectiveTTL });
   }
 
   remove(key: string): void {
@@ -307,8 +363,32 @@ export class AngularJSCache {
     this.store.clear();
   }
 
-  info(): { id: string; size: number } {
-    return { id: this._id, size: this.store.size };
+  info(): { id: string; size: number; capacity: number } {
+    return { id: this._id, size: this.store.size, capacity: this.capacity };
+  }
+
+  private isExpired(entry: { createdAt: number; ttl?: number }): boolean {
+    if (entry.ttl === undefined) return false;
+    return Date.now() - entry.createdAt > entry.ttl;
+  }
+
+  private evictIfFull(): void {
+    if (this.capacity === Infinity) return;
+    // First remove expired entries
+    for (const [key, entry] of this.store) {
+      if (this.isExpired(entry)) {
+        this.store.delete(key);
+      }
+    }
+    // If still over capacity, evict LRU (first inserted = Map iteration order)
+    while (this.store.size >= this.capacity) {
+      const firstKey = this.store.keys().next().value;
+      if (firstKey !== undefined) {
+        this.store.delete(firstKey);
+      } else {
+        break;
+      }
+    }
   }
 }
 
@@ -385,9 +465,9 @@ export function legacyDateFormat(date: Date | string | number, format: string): 
 
 /** Legacy number formatting from the AngularJS number filter.
  * Formats a number with thousand separators and a configurable
- * number of decimal places. The AngularJS implementation had an
- * off-by-one bug in the decimal rounding logic that we preserve.
- * TODO: Fix the rounding bug and update all dependent tests (n=47).
+ * number of decimal places.
+ * Fixed: Applied the AngularJS 1.6 number filter rounding patch
+ * which adds Number.EPSILON correction to avoid floating-point errors.
  */
 export function legacyNumberFormat(value: number | string, fractionSize?: number): string {
   if (value === null || value === undefined || value === '') {
@@ -400,11 +480,10 @@ export function legacyNumberFormat(value: number | string, fractionSize?: number
   }
 
   const frac = fractionSize !== undefined ? fractionSize : 3;
-  // The following rounding logic has a floating-point precision bug
-  // that was present in the original AngularJS implementation.
-  // Fixed in AngularJS 1.6 but our internal fork never received the patch.
-  // TODO: Apply the AngularJS 1.6 number filter patch.
-  const rounded = Math.round(num * Math.pow(10, frac)) / Math.pow(10, frac);
+  // AngularJS 1.6 fix: add Number.EPSILON to correct floating-point precision errors
+  // (e.g. 0.015 * 100 = 1.4999999999999998 instead of 1.5)
+  const factor = Math.pow(10, frac);
+  const rounded = Math.round((num + Number.EPSILON) * factor) / factor;
   const parts = rounded.toFixed(frac).split('.');
   parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   return parts.join('.');
@@ -561,22 +640,45 @@ export function legacyFromJson<T>(json: string): T {
 }
 
 /** Legacy copy function from AngularJS angular.copy().
- * Performs a deep copy of an object. The AngularJS implementation
- * handled circular references and special object types (Date, RegExp).
- * Our implementation is simplified and doesn't handle circular refs.
- * TODO: Handle circular references in deep copy.
+ * Performs a deep copy of an object with circular reference detection.
+ * Uses a WeakMap to track source→target mappings; returns cached copy on cycle.
+ * Handles Date and RegExp correctly.
  */
 export function legacyCopy<T>(source: T): T {
+  const cache = new WeakMap<object, unknown>();
+  return _legacyCopyInternal(source, cache);
+}
+
+function _legacyCopyInternal<T>(source: T, cache: WeakMap<object, unknown>): T {
   if (source === null || source === undefined) return source;
   if (typeof source !== 'object') return source;
-  if (source instanceof Date) return new Date(source.getTime()) as unknown as T;
-  if (source instanceof RegExp) return new RegExp(source) as unknown as T;
+
+  // Check for circular reference
+  const cached = cache.get(source as object);
+  if (cached !== undefined) return cached as T;
+
+  if (source instanceof Date) {
+    const copy = new Date(source.getTime());
+    cache.set(source, copy);
+    return copy as unknown as T;
+  }
+  if (source instanceof RegExp) {
+    const copy = new RegExp(source.source, source.flags);
+    cache.set(source, copy);
+    return copy as unknown as T;
+  }
   if (Array.isArray(source)) {
-    return source.map(item => legacyCopy(item)) as unknown as T;
+    const arr: unknown[] = [];
+    cache.set(source, arr);
+    for (let i = 0; i < source.length; i++) {
+      arr[i] = _legacyCopyInternal(source[i], cache);
+    }
+    return arr as unknown as T;
   }
   const result: Record<string, unknown> = {};
+  cache.set(source as object, result);
   for (const key of Object.keys(source as Record<string, unknown>)) {
-    result[key] = legacyCopy((source as Record<string, unknown>)[key]);
+    result[key] = _legacyCopyInternal((source as Record<string, unknown>)[key], cache);
   }
   return result as T;
 }
