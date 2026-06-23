@@ -137,11 +137,9 @@ class TerraformImporter:
                 logger.info(f"Terraform version: {version_info.get('terraform_version', 'unknown')}")
                 return True
             return False
-        except Exception as e:
+        except (subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError) as e:
             logger.error(f"Failed to check Terraform version: {e}")
             return False
-
-    def import_resource(self, resource: ResourceToImport) -> bool:
         address = f"{resource.resource_type}.{resource.resource_name}"
         cmd = [
             self.terraform_binary, "import",
@@ -185,8 +183,8 @@ class TerraformImporter:
                 "error": "Command timed out after 120 seconds",
             })
             return False
-        except Exception as e:
-            logger.error(f"  ✗ Exception importing {address}: {e}")
+        except subprocess.SubprocessError as e:
+            logger.error(f"  ✗ Subprocess error importing {address}: {e}")
             self.results.append({
                 "address": address,
                 "resource_id": resource.resource_id,
@@ -233,8 +231,8 @@ class TerraformImporter:
                             import_result.success_count += 1
                         else:
                             import_result.failure_count += 1
-                    except Exception as e:
-                        logger.error(f"Exception processing {resource.resource_name}: {e}")
+                    except (subprocess.SubprocessError, RuntimeError) as e:
+                        logger.error(f"Error processing {resource.resource_name}: {e}")
                         import_result.failure_count += 1
         else:
             for resource in resources:
@@ -288,7 +286,7 @@ class TerraformImporter:
             else:
                 logger.error(f"Terraform validation failed:\n{result.stderr}")
                 return False
-        except Exception as e:
+        except (subprocess.SubprocessError, json.JSONDecodeError) as e:
             logger.error(f"Terraform validation error: {e}")
             return False
 
