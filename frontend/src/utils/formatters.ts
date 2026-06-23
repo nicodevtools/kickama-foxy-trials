@@ -41,7 +41,9 @@ export function formatPrice(price: number, decimals?: number): string {
     else if (Math.abs(price) >= 0.0001) decimals = 8;
     else decimals = 10;
   }
-  return price.toFixed(decimals);
+  // Fix precision edge cases by applying Number.EPSILON correction before toFixed
+  const factor = Math.pow(10, decimals);
+  return (Math.round((price + Number.EPSILON) * factor) / factor).toFixed(decimals);
 }
 
 export function formatQuantity(qty: number, decimals?: number): string {
@@ -59,7 +61,9 @@ export function formatQuantity(qty: number, decimals?: number): string {
     else if (Math.abs(qty) >= 0.0001) decimals = 8;
     else decimals = 10;
   }
-  return qty.toFixed(decimals);
+  // Fix precision edge cases by applying Number.EPSILON correction before toFixed
+  const factor = Math.pow(10, decimals);
+  return (Math.round((qty + Number.EPSILON) * factor) / factor).toFixed(decimals);
 }
 
 export function formatVolume(volume: number): string {
@@ -404,13 +408,46 @@ export function retry<T>(fn: () => Promise<T>, maxRetries: number = 3, delay: nu
   });
 }
 
-export function memoize<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
-  const cache = new Map<string, T>();
+export function memoize<T>(fn: (...args: any[]) => T, options?: { maxSize?: number; ttl?: number }): (...args: any[]) => T {
+  const maxSize = options?.maxSize ?? 500;
+  const ttl = options?.ttl; // undefined = no expiry
+  const cache = new Map<string, { value: T; ts: number; key: string }>();
+  // Track insertion order for LRU eviction
+  const insertionOrder: string[] = [];
+
   return (...args: any[]) => {
     const key = JSON.stringify(args);
-    if (cache.has(key)) return cache.get(key)!;
+    const now = Date.now();
+
+    const cached = cache.get(key);
+    if (cached !== undefined) {
+      // Check TTL expiry
+      if (ttl !== undefined && now - cached.ts > ttl) {
+        cache.delete(key);
+        const idx = insertionOrder.indexOf(key);
+        if (idx !== -1) insertionOrder.splice(idx, 1);
+      } else {
+        // LRU: move to end
+        const idx = insertionOrder.indexOf(key);
+        if (idx !== -1) {
+          insertionOrder.splice(idx, 1);
+          insertionOrder.push(key);
+        }
+        return cached.value;
+      }
+    }
+
     const result = fn(...args);
-    cache.set(key, result);
+
+    // Evict LRU if at capacity
+    if (insertionOrder.length >= maxSize) {
+      const evicted = insertionOrder.shift();
+      if (evicted !== undefined) cache.delete(evicted);
+    }
+
+    cache.set(key, { value: result, ts: now, key });
+    insertionOrder.push(key);
+
     return result;
   };
 }
