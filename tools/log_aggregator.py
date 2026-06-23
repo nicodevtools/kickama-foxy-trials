@@ -42,8 +42,9 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Counter, Dict, List, Optional, Tuple
@@ -93,7 +94,7 @@ class LogParser:
                             return int(dt.replace(tzinfo=timezone.utc).timestamp())
                         except ValueError:
                             continue
-                except:
+                except (ValueError, Exception):
                     pass
         return None
 
@@ -174,7 +175,7 @@ class NginxLogParser(LogParser):
         try:
             dt = datetime.strptime(match.group(4), '%d/%b/%Y:%H:%M:%S %z')
             timestamp = int(dt.timestamp())
-        except:
+        except ValueError:
             timestamp = None
 
         status_code = int(match.group(6))
@@ -212,6 +213,7 @@ class LogAggregator:
         self.error_patterns: Counter = Counter()
         self.top_errors: Counter = Counter()
         self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
+        self._lock = threading.Lock()
 
     def process_file(self, filepath: str) -> int:
         parsed_count = 0
@@ -239,6 +241,86 @@ class LogAggregator:
             total += count
             logger.debug(f"  {filepath.name}: {count} entries")
         return total
+
+    def process_directory_parallel(
+        self,
+        dirpath: str,
+        pattern: str = "*.log",
+        max_workers: int = 4,
+    ) -> int:
+        """Process all log files in a directory in parallel using ThreadPoolExecutor."""
+        path = Path(dirpath)
+        filepaths = list(path.glob(pattern))
+
+        if not filepaths:
+            logger.warning(f"No files matching '{pattern}' found in {dirpath}")
+            return 0
+
+        logger.info(
+            f"Processing {len(filepaths)} files in parallel with {max_workers} workers..."
+        )
+
+        total = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {
+                executor.submit(self._process_file_threadsafe, str(fp)): fp
+                for fp in filepaths
+            }
+            for future in as_completed(future_to_file):
+                fp = future_to_file[future]
+                try:
+                    count = future.result()
+                    total += count
+                    logger.debug(f"  {fp.name}: {count} entries")
+                except Exception as e:
+                    logger.error(f"Error processing {fp.name}: {e}")
+
+        return total
+
+    def _process_file_threadsafe(self, filepath: str) -> int:
+        """Process a single file and merge results under a lock (thread-safe)."""
+        parsed_count = 0
+        try:
+            if filepath.endswith('.gz'):
+                with gzip.open(filepath, 'rt', errors='replace') as f:
+                    lines = list(f)
+            else:
+                with open(filepath, 'r', errors='replace') as f:
+                    lines = list(f)
+        except Exception as e:
+            logger.error(f"Error reading {filepath}: {e}")
+            return 0
+
+        # Parse locally first, then merge under lock
+        local_entries = []
+        for line in lines:
+            for parser in self.parsers:
+                entry = parser.parse(line)
+                if entry:
+                    local_entries.append(entry)
+                    parsed_count += 1
+                    break
+
+        # Merge into shared state under lock
+        with self._lock:
+            for entry in local_entries:
+                self.entries.append(entry)
+                ts = entry.get('timestamp')
+                if ts:
+                    hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
+                    self.hourly_counts[hour] += 1
+                level = entry.get('level', 'unknown').lower()
+                self.level_counts[level] += 1
+                service = entry.get('service', 'unknown')
+                self.service_counts[service] += 1
+                if level in ('error', 'critical'):
+                    msg = entry.get('message', '')
+                    if len(msg) > 200:
+                        msg = msg[:200]
+                    self.errors_by_service[service].append(msg)
+                    self.error_patterns[msg] += 1
+
+        return parsed_count
 
     def _parse_line(self, line: str) -> bool:
         for parser in self.parsers:
@@ -412,6 +494,7 @@ def parse_args():
     parser.add_argument("--format", choices=["json", "csv", "html"], default="json", help="Output format")
     parser.add_argument("--search", help="Search for a string in logs")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers for directory processing")
     return parser.parse_args()
 
 
@@ -433,7 +516,12 @@ def main():
             logger.info(f"Processed {args.input}: {count} entries")
 
     if args.dir:
-        count = aggregator.process_directory(args.dir)
+        if args.workers > 1:
+            count = aggregator.process_directory_parallel(
+                args.dir, max_workers=args.workers
+            )
+        else:
+            count = aggregator.process_directory(args.dir)
         logger.info(f"Processed directory {args.dir}: {count} entries")
 
     if args.search:
