@@ -81,6 +81,111 @@ export function aggregateTradesToOHLCV(
 ): OHLCV[] {
   if (trades.length === 0) return [];
 
+  // For large datasets (>50K trades), offload to async chunked processing
+  if (trades.length > 50000) {
+    throw new Error(
+      'Large dataset detected. Use aggregateTradesToOHLCVAsync() for datasets >50K trades to avoid blocking the main thread.'
+    );
+  }
+
+  return _aggregateTradesToOHLCVSync(trades, interval, startTime, endTime);
+}
+
+/**
+ * Async version that processes trades in chunks via setTimeout
+ * to avoid blocking the UI thread for large datasets.
+ */
+export async function aggregateTradesToOHLCVAsync(
+  trades: TradeTick[],
+  interval: AggregationInterval,
+  startTime?: number,
+  endTime?: number,
+  chunkSize: number = 10000
+): Promise<OHLCV[]> {
+  if (trades.length === 0) return [];
+
+  const intervalMs = INTERVAL_MS[interval];
+  const sorted = [...trades].sort((a, b) => a.time - b.time);
+
+  const effectiveStart = startTime ?? sorted[0].time;
+  const effectiveEnd = endTime ?? sorted[sorted.length - 1].time;
+
+  const buckets = new Map<number, { open: number; high: number; low: number; close: number; volume: number; count: number }>();
+
+  // Process in chunks, yielding to event loop between chunks
+  for (let i = 0; i < sorted.length; i += chunkSize) {
+    const chunk = sorted.slice(i, i + chunkSize);
+    for (const trade of chunk) {
+      if (trade.time < effectiveStart || trade.time > effectiveEnd) continue;
+      const bucketTime = Math.floor(trade.time / intervalMs) * intervalMs;
+
+      const existing = buckets.get(bucketTime);
+      if (existing) {
+        existing.high = Math.max(existing.high, trade.price);
+        existing.low = Math.min(existing.low, trade.price);
+        existing.close = trade.price;
+        existing.volume += trade.size;
+        existing.count++;
+      } else {
+        buckets.set(bucketTime, {
+          open: trade.price,
+          high: trade.price,
+          low: trade.price,
+          close: trade.price,
+          volume: trade.size,
+          count: 1,
+        });
+      }
+    }
+    // Yield to main thread between chunks
+    if (i + chunkSize < sorted.length) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+
+  // Fill gaps with null candles (zero volume)
+  const result: OHLCV[] = [];
+  let currentTime = effectiveStart - (effectiveStart % intervalMs);
+  const endBucket = Math.floor(effectiveEnd / intervalMs) * intervalMs;
+
+  while (currentTime <= endBucket) {
+    const bucket = buckets.get(currentTime);
+    if (bucket) {
+      result.push({
+        time: currentTime / 1000,
+        open: bucket.open,
+        high: bucket.high,
+        low: bucket.low,
+        close: bucket.close,
+        volume: bucket.volume,
+      });
+    } else {
+      const lastCandle = result[result.length - 1];
+      if (lastCandle) {
+        result.push({
+          time: currentTime / 1000,
+          open: lastCandle.close,
+          high: lastCandle.close,
+          low: lastCandle.close,
+          close: lastCandle.close,
+          volume: 0,
+        });
+      }
+    }
+    currentTime += intervalMs;
+  }
+
+  return result;
+}
+
+function _aggregateTradesToOHLCVSync(
+  trades: TradeTick[],
+  interval: AggregationInterval,
+  startTime?: number,
+  endTime?: number
+): OHLCV[] {
+  if (trades.length === 0) return [];
+
   const intervalMs = INTERVAL_MS[interval];
   const sorted = [...trades].sort((a, b) => a.time - b.time);
 
